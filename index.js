@@ -1,8 +1,3 @@
-/**
- * APX-PHANTOM V2.1 - RAILWAY & WAKE-LOCK EDITION
- * Fixes: Sleeping sessions, Stuck /add command, and Handshake loops.
- */
-
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -22,23 +17,30 @@ const phantomSessions = new Map();
 const isConnected = new Map();
 const notifiedOnline = new Map();
 const heartbeats = new Map();
-
 let ctx_chat_id;
 
-// --- RAILWAY WAKE-LOCK SERVER ---
-// Railway puts apps to sleep if they don't have a web port open.
+// --- 1. WAKE-LOCK (STOPS RAILWAY FROM SLEEPING) ---
 http.createServer((req, res) => {
-    res.write("APX-PHANTOM IS ALIVE");
+    res.write("PHANTOM STATUS: ACTIVE");
     res.end();
 }).listen(process.env.PORT || 8080);
 
-async function startPhantom(phoneNumber) {
-    // If it exists but NOT connected, allow it to try again
-    if (phantomSessions.has(phoneNumber) && isConnected.get(phoneNumber)) return;
-
+async function startPhantom(phoneNumber, forceReset = false) {
     const sessionDir = `./phantom_sessions/${phoneNumber}`;
-    await fs.ensureDir(sessionDir);
 
+    // --- 2. DEEP CLEANER LOGIC ---
+    if (forceReset || (phantomSessions.has(phoneNumber) && !isConnected.get(phoneNumber))) {
+        try {
+            if (phantomSessions.has(phoneNumber)) {
+                phantomSessions.get(phoneNumber).end();
+            }
+        } catch (e) {}
+        phantomSessions.delete(phoneNumber);
+        isConnected.delete(phoneNumber);
+        fs.removeSync(sessionDir); 
+    }
+
+    await fs.ensureDir(sessionDir);
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -51,33 +53,23 @@ async function startPhantom(phoneNumber) {
         logger: pino({ level: "silent" }),
         browser: ["Ubuntu", "Chrome", "20.0.04"],
         markOnlineOnConnect: true,
-        // ENHANCEMENT: Aggressive keep-alive for Railway
-        keepAliveIntervalMs: 30000,
-        mobile: false
+        keepAliveIntervalMs: 30000 // Keep connection hot
     });
 
     phantomSessions.set(phoneNumber, sock);
 
-    // --- PAIRING CODE LOGIC (AUTO-RESET ON FAIL) ---
+    // --- 3. PAIRING LOGIC ---
     if (!sock.authState.creds.registered) {
-        let hasRequested = false;
-        sock.ev.on('connection.update', async (up) => {
-            const { connection } = up;
-            if (connection === 'connecting' && !hasRequested) {
-                hasRequested = true;
-                setTimeout(async () => {
-                    try {
-                        // If still not registered after delay, ask for code
-                        if (!sock.authState.creds.registered) {
-                            const code = await sock.requestPairingCode(phoneNumber);
-                            if (ctx_chat_id) bot.telegram.sendMessage(ctx_chat_id, `👻 *PHANTOM CODE:* \`${code}\``);
-                        }
-                    } catch (err) {
-                        hasRequested = false; // Reset so user can try /add again
-                    }
-                }, 10000);
+        setTimeout(async () => {
+            try {
+                if (!sock.authState.creds.registered) {
+                    const code = await sock.requestPairingCode(phoneNumber);
+                    if (ctx_chat_id) bot.telegram.sendMessage(ctx_chat_id, `👻 *PHANTOM CODE:* \`${code}\``);
+                }
+            } catch (err) {
+                phantomSessions.delete(phoneNumber);
             }
-        });
+        }, 10000);
     }
 
     let currentStateIndex = 0;
@@ -88,15 +80,11 @@ async function startPhantom(phoneNumber) {
         try {
             await sock.sendPresenceUpdate(states[currentStateIndex], 'status@broadcast');
             currentStateIndex = (currentStateIndex + 1) % states.length;
-        } catch (e) {
-            // If presence fails, the socket might be dead
-            isConnected.set(phoneNumber, false);
-        }
+        } catch (e) {}
     };
 
     sock.ev.on('connection.update', (u) => {
         const { connection, lastDisconnect } = u;
-        
         if (connection === 'open') {
             isConnected.set(phoneNumber, true);
             if (!notifiedOnline.get(phoneNumber)) {
@@ -104,24 +92,14 @@ async function startPhantom(phoneNumber) {
                 notifiedOnline.set(phoneNumber, true); 
             }
             if (heartbeats.has(phoneNumber)) clearInterval(heartbeats.get(phoneNumber));
-            const interval = setInterval(() => rotatePresence(), 8000);
-            heartbeats.set(phoneNumber, interval);
+            heartbeats.set(phoneNumber, setInterval(() => rotatePresence(), 8000));
         }
-
         if (connection === 'close') {
             isConnected.set(phoneNumber, false);
             notifiedOnline.set(phoneNumber, false);
-            if (heartbeats.has(phoneNumber)) clearInterval(heartbeats.get(phoneNumber));
-            
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect && phantomSessions.has(phoneNumber)) {
-                // Cleanup before reconnecting
                 setTimeout(() => startPhantom(phoneNumber), 5000);
-            } else {
-                // If logged out or fatal, clear from maps so /add works again
-                phantomSessions.delete(phoneNumber);
             }
         }
     });
@@ -136,41 +114,40 @@ async function startPhantom(phoneNumber) {
     });
 }
 
+// --- 4. COMMAND CENTER ---
 bot.on('text', async (ctx) => {
     ctx_chat_id = ctx.chat.id;
     const text = ctx.message.text.trim();
 
     if (text.startsWith('/add_')) {
         const num = text.split('_')[1].replace(/\D/g, '');
-        
-        // If it's stuck in a non-connected state, clear it
-        if (phantomSessions.has(num) && !isConnected.get(num)) {
-            phantomSessions.delete(num);
-        }
-
-        if (phantomSessions.has(num)) return ctx.reply("⚠️ This number is already active!");
-        
-        ctx.reply(`🚀 Deploying Shapeshifter for ${num}...`);
-        startPhantom(num);
+        const isStuck = phantomSessions.has(num) && !isConnected.get(num);
+        if (phantomSessions.has(num) && isConnected.get(num)) return ctx.reply("⚠️ Active!");
+        ctx.reply(`🚀 Deploying for ${num}...`);
+        startPhantom(num, isStuck);
     }
 
     if (text.startsWith('/remove_')) {
         const num = text.split('_')[1].replace(/\D/g, '');
         if (phantomSessions.has(num)) {
-            const sock = phantomSessions.get(num);
-            isConnected.set(num, false);
-            if (heartbeats.has(num)) clearInterval(heartbeats.get(num));
-            
-            try { sock.logout(); } catch (e) {}
+            try { phantomSessions.get(num).logout(); } catch (e) {}
             phantomSessions.delete(num);
-            fs.removeSync(`./phantom_sessions/${num}`); // Clear data on manual removal
-            ctx.reply(`🛑 Session Cleared: ${num}`);
-        } else {
-            ctx.reply("❌ Number not found.");
+            isConnected.delete(num);
+            fs.removeSync(`./phantom_sessions/${num}`);
+            ctx.reply(`🛑 Removed: ${num}`);
         }
+    }
+
+    if (text === '/list') {
+        let list = "📑 *PHANTOM SESSIONS:*\n\n";
+        phantomSessions.forEach((_, num) => {
+            const status = isConnected.get(num) ? "🟢 Online" : "🔴 Stuck/Connecting";
+            list += `👤 ${num}: ${status}\n`;
+        });
+        ctx.replyWithMarkdown(list || "No active sessions.");
     }
 });
 
 bot.launch();
-console.log("🪬 APX-PHANTOM V2.1 - RAILWAY ENHANCED");
+console.log("🪬 APX-PHANTOM V2.2 - FULLY STABILIZED");
 
